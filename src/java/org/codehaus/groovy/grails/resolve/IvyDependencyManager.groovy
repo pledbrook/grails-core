@@ -26,6 +26,7 @@ import org.apache.ivy.core.resolve.ResolveOptions
 import org.apache.ivy.core.settings.IvySettings
 import org.apache.ivy.core.sort.SortEngine
 import org.apache.ivy.plugins.resolver.ChainResolver
+import org.apache.ivy.plugins.resolver.DependencyResolver
 import org.apache.ivy.plugins.resolver.FileSystemResolver
 import org.apache.ivy.plugins.resolver.IBiblioResolver
 import org.apache.ivy.util.DefaultMessageLogger
@@ -37,20 +38,17 @@ import grails.util.GrailsNameUtils
 
 import org.apache.ivy.core.module.id.ModuleId
 import org.apache.ivy.core.report.ArtifactDownloadReport
-import org.apache.ivy.util.url.CredentialsStore
 import org.apache.ivy.core.module.descriptor.ModuleDescriptor
 import org.apache.ivy.core.module.descriptor.DefaultDependencyArtifactDescriptor
 import grails.util.Metadata
-import groovyx.gpars.Parallelizer;
+import groovyx.gpars.Parallelizer
+import org.codehaus.groovy.tools.RootLoader
 
-import org.apache.ivy.plugins.latest.LatestTimeStrategy
 import org.apache.ivy.util.MessageLogger
 import org.apache.ivy.core.module.descriptor.Artifact
 import org.apache.ivy.core.report.ConfigurationResolveReport
 import org.apache.ivy.core.report.DownloadReport
 import org.apache.ivy.core.report.DownloadStatus
-import org.apache.ivy.plugins.matcher.PatternMatcher
-import org.apache.ivy.plugins.matcher.ExactPatternMatcher
 import org.apache.ivy.core.module.descriptor.DefaultExcludeRule
 import org.apache.ivy.core.module.id.ArtifactId
 import org.apache.ivy.core.module.descriptor.DefaultDependencyDescriptor
@@ -61,6 +59,17 @@ import jsr166y.forkjoin.ForkJoinPool;
 
 import org.apache.ivy.plugins.resolver.RepositoryResolver
 import org.apache.ivy.plugins.parser.m2.PomModuleDescriptorParser
+import org.apache.ivy.core.resolve.ResolvedModuleRevision
+import org.apache.ivy.core.resolve.ResolveData
+import org.apache.ivy.plugins.resolver.util.ResolvedResource
+import org.apache.ivy.core.resolve.DownloadOptions
+import org.apache.ivy.core.cache.ArtifactOrigin
+import org.apache.ivy.core.search.OrganisationEntry
+import org.apache.ivy.core.search.ModuleEntry
+import org.apache.ivy.core.search.RevisionEntry
+import org.apache.ivy.plugins.namespace.Namespace
+import org.apache.ivy.plugins.resolver.ResolverSettings
+import org.apache.ivy.core.cache.RepositoryCacheManager
 
 /**
  * Implementation that uses Apache Ivy under the hood.
@@ -68,6 +77,7 @@ import org.apache.ivy.plugins.parser.m2.PomModuleDescriptorParser
  * @author Graeme Rocher
  * @since 1.2
  */
+@Typed(TypePolicy.MIXED)
 class IvyDependencyManager extends AbstractIvyDependencyManager implements DependencyResolver, DependencyDefinitionParser{
 
     
@@ -147,7 +157,7 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
      * Resets the Grails plugin resolver if it is used
      */
     void resetGrailsPluginsResolver() {
-        def resolver = chainResolver.resolvers.find { it.name == 'grailsPlugins' }
+        def resolver = chainResolver.resolvers.find { DependencyResolver r -> r.name == 'grailsPlugins' }
         chainResolver.resolvers.remove(resolver)
         chainResolver.resolvers.add(new GrailsPluginsDirectoryResolver(buildSettings, ivySettings))
     }
@@ -374,7 +384,7 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
     * Returns all the dependency descriptors for dependencies of a plugin that have been exported for use in the application
     */
     Set<DependencyDescriptor> getExportedDependencyDescriptors(String scope = null) {
-        getApplicationDependencyDescriptors(scope).findAll { it.exported }
+        getApplicationDependencyDescriptors(scope).findAll { ((EnhancedDefaultDependencyDescriptor) it).exported }
     }
 
     boolean isExcluded(String name) {
@@ -397,15 +407,15 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
         if (args?.group && args?.name && args?.version) {
             def transitive = getBooleanValue(args, 'transitive')
             def exported = getBooleanValue(args, 'export')
-            def scope = args.conf ?: 'runtime'
+            String scope = args.conf ?: 'runtime'
             def mrid = ModuleRevisionId.newInstance(args.group, args.name, args.version)
-            def dd = new EnhancedDefaultDependencyDescriptor(mrid, true, transitive, scope)
+            def dd = new EnhancedDefaultDependencyDescriptor(mrid, true, transitive, (String) scope)
             dd.exported = exported
             dd.inherited = true
             dd.plugin = pluginName
             configureDependencyDescriptor(dd, scope)
-            if (args.excludes) {
-                for (ex in excludes) {
+            if (args.excludes && args.excludes instanceof List) {
+                for (String ex in ((List) args.excludes)) {
                     dd.exclude(ex)
                 }
             }
@@ -465,7 +475,7 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
      */
     ResolveReport loadDependencies(String conf = '') {
 
-        URLClassLoader rootLoader = getClass().classLoader.rootLoader
+        RootLoader rootLoader = getClass().classLoader.rootLoader
         if (rootLoader) {
             def urls = rootLoader.URLs.toList()
             ResolveReport report = resolveDependencies(conf)
@@ -521,11 +531,22 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
         resolveErrors = false
         if (usedConfigurations.contains(conf) || conf == '') {
 
-            if (args.checkIfChanged == null) args.checkIfChanged = true
-            if (args.outputReport == null) args.outputReport = true
-            if (args.validate == null) args.validate = false
+//            if (args.checkIfChanged == null) args.checkIfChanged = true
+//            if (args.outputReport == null) args.outputReport = true
+//            if (args.validate == null) args.validate = false
 
-            def options = new ResolveOptions(args)
+            def options = new ResolveOptions()
+            options.checkIfChanged = args.checkIfChanged ?: true
+            options.outputReport = args.outputReport ?: true
+            options.validate = args.validate ?: false
+            if (args.date) options.date = args.date
+            if (args.resolveId) options.resolveId = args.resolveId
+            if (args.resolveMode) options.resolveMode = args.resolveMode
+            if (args.revision) options.revision = args.revision
+            if (args.download != null) options.download = args.download
+            if (args.refresh != null) options.refresh = args.refresh
+            if (args.useCacheOnly != null) options.useCacheOnly = args.useCacheOnly
+
             if (conf) {
                 options.confs = [conf] as String[]
             }
@@ -613,7 +634,11 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
 								def enhancedDependencyDescriptor = new EnhancedDefaultDependencyDescriptor(moduleRevisionId, false, true, scope)
 								for (ExcludeRule excludeRule in dependencyDescriptor.getAllExcludeRules()) {
 									ModuleId excludedModule = excludeRule.getId().getModuleId()
-									enhancedDependencyDescriptor.addRuleForModuleId(excludedModule, scope)
+									enhancedDependencyDescriptor.addRuleForModuleId(
+											excludedModule,
+											scope,
+											EnhancedDefaultDependencyDescriptor.WILDCARD,
+											EnhancedDefaultDependencyDescriptor.WILDCARD)
 								}
 								configureDependencyDescriptor(enhancedDependencyDescriptor, scope)
 								addDependencyDescriptor enhancedDependencyDescriptor
@@ -622,9 +647,9 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
 					}
 				}
 	
-				def installedPlugins = metadata?.getInstalledPlugins()
+				def installedPlugins = metadata?.installedPlugins
 				if (installedPlugins) {
-					for (entry in installedPlugins) {
+					for (entry in installedPlugins.entrySet()) {
 						if (!pluginDependencyNames.contains(entry.key)) {
 							def name = entry.key
 							def scope = "runtime"
@@ -653,7 +678,7 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
           PomModuleDescriptorParser parser = PomModuleDescriptorParser.getInstance()
           ModuleDescriptor md = parser.parseDescriptor(ivySettings, pom.toURL(), false)
 
-          fixedDependencies = md.getDependencies()
+          fixedDependencies = md.dependencies as List<DependencyDescriptor>
       }
 
       return fixedDependencies
@@ -686,510 +711,99 @@ class IvyDependencyManager extends AbstractIvyDependencyManager implements Depen
 
     }
 
-    boolean getBooleanValue(dependency, String name) {
+    boolean getBooleanValue(Map dependency, String name) {
         return dependency.containsKey(name) ? Boolean.valueOf(dependency[name]) : true
     }
-}
 
-class IvyDomainSpecificLanguageEvaluator {
-
-    static final String WILDCARD = '*'
-
-    boolean inherited = false
-    boolean pluginMode = false
-	boolean repositoryMode = false
-	
-    String currentPluginBeingConfigured = null
-    @Delegate IvyDependencyManager delegate
-
-    IvyDomainSpecificLanguageEvaluator(IvyDependencyManager delegate) {
-        this.delegate = delegate
+    String getName() {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void useOrigin(boolean b) {
-        ivySettings.setDefaultUseOrigin(b)
+    void setName(String s) {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void credentials(Closure c) {
-        def creds = [:]
-        c.delegate = creds
-        c.resolveStrategy = Closure.DELEGATE_FIRST
-        c.call()
-
-        if (creds) {
-            CredentialsStore.INSTANCE.addCredentials(creds.realm ?: null, creds.host ?: 'localhost', creds.username ?: '', creds.password ?: '')
-        }
+    ResolvedModuleRevision getDependency(DependencyDescriptor dependencyDescriptor, ResolveData resolveData) {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void pom(boolean b) {
-        delegate.readPom = b
+    ResolvedResource findIvyFileRef(DependencyDescriptor dependencyDescriptor, ResolveData resolveData) {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void excludes(Map exclude) {
-        def anyExpression = PatternMatcher.ANY_EXPRESSION
-        def mid = ModuleId.newInstance(exclude.group ?: anyExpression, exclude.name.toString())
-        def aid = new ArtifactId(mid, anyExpression, anyExpression, anyExpression)
-
-        def excludeRule = new DefaultExcludeRule(aid, ExactPatternMatcher.INSTANCE, null)
-
-        for (String conf in configurationNames) {
-            excludeRule.addConfiguration conf
-        }
-
-        if (currentDependencyDescriptor == null) {
-            moduleDescriptor.addExcludeRule(excludeRule)
-        }
-        else {
-            for (String conf in configurationNames) {
-                currentDependencyDescriptor.addExcludeRule(conf, excludeRule)
-            }
-        }
+    DownloadReport download(Artifact[] artifacts, DownloadOptions downloadOptions) {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void excludes(String... excludeList) {
-        for (exclude in excludeList) {
-            excludes name:exclude
-        }
+    ArtifactDownloadReport download(ArtifactOrigin artifactOrigin, DownloadOptions downloadOptions) {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void defaultDependenciesProvided(boolean b) {
-        delegate.defaultDependenciesProvided = b
+    boolean exists(Artifact artifact) {
+        return false;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void inherits(String name, Closure configurer) {
-        // plugins can't configure inheritance
-        if (currentPluginBeingConfigured) return
-
-        configurer?.delegate = this
-        configurer?.call()
-
-        def config = buildSettings?.config?.grails
-        if (config) {
-            def dependencies = config[name]?.dependency?.resolution
-            if (dependencies instanceof Closure) {
-                try {
-                    inherited = true
-                    dependencies.delegate = this
-                    dependencies.call()
-                    moduleExcludes.clear()
-                }
-                finally {
-                    inherited = false
-                }
-            }
-        }
+    ArtifactOrigin locate(Artifact artifact) {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void inherits(String name) {
-        inherits name, null
-    }
-	
-
-    void plugins(Closure callable) {
-        try {
-            pluginMode = true
-            callable.call()
-        }
-        finally {
-            pluginMode = false
-        }
+    void publish(Artifact artifact, File file, boolean b) {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void plugin(String name, Closure callable) {
-        configuredPlugins << name
-
-        try {
-            currentPluginBeingConfigured = name
-            callable?.delegate = this
-            callable?.call()
-        }
-        finally {
-            currentPluginBeingConfigured = null
-        }
+    void beginPublishTransaction(ModuleRevisionId moduleRevisionId, boolean b) {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void log(String level) {
-        // plugins can't configure log
-        if (currentPluginBeingConfigured) return
-
-        switch(level) {
-            case "warn":    setLogger(new DefaultMessageLogger(Message.MSG_WARN)); break
-            case "error":   setLogger(new DefaultMessageLogger(Message.MSG_ERR)); break
-            case "info":    setLogger(new DefaultMessageLogger(Message.MSG_INFO)); break
-            case "debug":   setLogger(new DefaultMessageLogger(Message.MSG_DEBUG)); break
-            case "verbose": setLogger(new DefaultMessageLogger(Message.MSG_VERBOSE)); break
-            default:        setLogger(new DefaultMessageLogger(Message.MSG_WARN))
-        }
-        Message.setDefaultLogger logger
+    void abortPublishTransaction() {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    /**
-     * Defines dependency resolvers
-     */
-    void resolvers(Closure resolvers) {
-        repositories resolvers
+    void commitPublishTransaction() {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    /**
-     * Same as #resolvers(Closure)
-     */
-    void repositories(Closure repos) {
-		try {
-			repositoryMode = true
-			repos?.delegate = this
-			repos?.call()
-		}
-		finally {
-			repositoryMode = false
-		}
-    }
-	
-	void inherit(boolean b) {
-		if(repositoryMode) {
-			inheritRepositories = b
-		}
-	}
-
-
-    void flatDir(Map args) {
-        def name = args.name?.toString()
-        if (name && args.dirs) {
-            def fileSystemResolver = new FileSystemResolver()
-            fileSystemResolver.local = true
-            fileSystemResolver.name = name
-
-            def dirs = args.dirs instanceof Collection ? args.dirs : [args.dirs]
-
-            repositoryData << ['type':'flatDir', name:name, dirs:dirs.join(',')]
-            dirs.each { dir ->
-                def path = new File(dir?.toString()).absolutePath
-                fileSystemResolver.addIvyPattern( "${path}/[module]-[revision](-[classifier]).xml")
-                fileSystemResolver.addArtifactPattern "${path}/[module]-[revision](-[classifier]).[ext]"
-            }
-            fileSystemResolver.settings = ivySettings
-
-            addToChainResolver(fileSystemResolver)
-        }
+    void reportFailure() {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    private addToChainResolver(org.apache.ivy.plugins.resolver.DependencyResolver resolver) {
-		if(currentPluginBeingConfigured && !inheritRepositories) return 
-		
-		if (transferListener !=null && (resolver instanceof RepositoryResolver)) {
-			((RepositoryResolver)resolver).repository.addTransferListener transferListener
-		}
-		// Fix for GRAILS-5805
-		synchronized(chainResolver.resolvers) {
-			chainResolver.add resolver
-		}
-		
+    void reportFailure(Artifact artifact) {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void grailsPlugins() {
-        if (isResolverNotAlreadyDefined('grailsPlugins')) {
-            repositoryData << [type: 'grailsPlugins', name:"grailsPlugins"]
-            if (buildSettings != null) {
-                def pluginResolver = new GrailsPluginsDirectoryResolver(buildSettings, ivySettings)
-                addToChainResolver(pluginResolver)
-            }
-        }
+    String[] listTokenValues(String s, Map map) {
+        return new String[0];  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void grailsHome() {
-        if (!isResolverNotAlreadyDefined('grailsHome')) {
-            return
-        }
-
-        def grailsHome = buildSettings?.grailsHome?.absolutePath ?: System.getenv("GRAILS_HOME")
-        if (!grailsHome) {
-            return
-        }
-
-        flatDir(name:"grailsHome", dirs:"${grailsHome}/lib")
-        flatDir(name:"grailsHome", dirs:"${grailsHome}/dist")
-        if (grailsHome!='.') {
-            def resolver = createLocalPluginResolver("grailsHome", grailsHome)
-            addToChainResolver(resolver)
-        }
+    Map[] listTokenValues(String[] strings, Map map) {
+        return new Map[0];  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    FileSystemResolver createLocalPluginResolver(String name, String location) {
-        def pluginResolver = new FileSystemResolver(name: name)
-        pluginResolver.addArtifactPattern("${location}/plugins/grails-[artifact]-[revision].[ext]")
-        pluginResolver.settings = ivySettings
-        pluginResolver.latestStrategy = new LatestTimeStrategy()
-        pluginResolver.changingPattern = ".*SNAPSHOT"
-        pluginResolver.setCheckmodified(true)
-        return pluginResolver
+    OrganisationEntry[] listOrganisations() {
+        return new OrganisationEntry[0];  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    private boolean isResolverNotAlreadyDefined(String name) {
-        def resolver
-        // Fix for GRAILS-5805
-        synchronized(chainResolver.resolvers) {
-            resolver = chainResolver.resolvers.any { it.name == name }
-        }
-        if (resolver) {
-            Message.debug("Dependency resolver $name already defined. Ignoring...")
-            return false
-        }
-        return true
+    ModuleEntry[] listModules(OrganisationEntry organisationEntry) {
+        return new ModuleEntry[0];  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void mavenRepo(String url) {
-        if (isResolverNotAlreadyDefined(url)) {
-            repositoryData << ['type':'mavenRepo', root:url, name:url, m2compatbile:true]
-            def resolver = new IBiblioResolver(name: url, root: url, m2compatible: true, settings: ivySettings, changingPattern: ".*SNAPSHOT")
-            addToChainResolver(resolver)
-        }
+    RevisionEntry[] listRevisions(ModuleEntry moduleEntry) {
+        return new RevisionEntry[0];  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void mavenRepo(Map args) {
-        if (args && args.name) {
-            if (isResolverNotAlreadyDefined(args.name)) {
-                repositoryData << ( ['type':'mavenRepo'] + args )
-                args.settings = ivySettings
-                def resolver = new IBiblioResolver(args)
-                addToChainResolver(resolver)
-            }
-        }
-        else {
-            Message.warn("A mavenRepo specified doesn't have a name argument. Please specify one!")
-        }
+    Namespace getNamespace() {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void resolver(org.apache.ivy.plugins.resolver.DependencyResolver resolver) {
-        if (resolver) {
-            resolver.setSettings(ivySettings)
-            addToChainResolver(resolver)
-        }
+    void dumpSettings() {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    void ebr() {
-        if (isResolverNotAlreadyDefined('ebr')) {
-            repositoryData << ['type':'ebr']
-            IBiblioResolver ebrReleaseResolver = new IBiblioResolver(name:"ebrRelease",
-                                                                     root:"http://repository.springsource.com/maven/bundles/release",
-                                                                     m2compatible:true,
-                                                                     settings:ivySettings)
-            addToChainResolver(ebrReleaseResolver)
-
-            IBiblioResolver ebrExternalResolver = new IBiblioResolver(name:"ebrExternal",
-                                                                      root:"http://repository.springsource.com/maven/bundles/external",
-                                                                      m2compatible:true,
-                                                                      settings:ivySettings)
-
-            addToChainResolver(ebrExternalResolver)
-        }
+    void setSettings(ResolverSettings resolverSettings) {
+        //To change body of implemented methods use File | Settings | File Templates.
     }
 
-    /**
-     * Defines a repository that uses Grails plugin repository format. Grails repositories are
-     * SVN repositories that follow a particular convention that is not Maven compatible.
-     *
-     * Ivy is flexible enough to allow the configuration of a resolver that resolves artifacts
-     * against non-Maven repositories
-     */
-    void grailsRepo(String url, String name=null) {
-        if (isResolverNotAlreadyDefined(name ?: url)) {
-            repositoryData << ['type':'grailsRepo', url:url]
-            def urlResolver = new GrailsRepoResolver(name ?: url, new URL(url) )
-            urlResolver.addArtifactPattern("${url}/grails-[artifact]/tags/RELEASE_*/grails-[artifact]-[revision].[ext]")
-            urlResolver.settings = ivySettings
-            urlResolver.latestStrategy = new org.apache.ivy.plugins.latest.LatestTimeStrategy()
-            urlResolver.changingPattern = ".*"
-            urlResolver.setCheckmodified(true)
-            addToChainResolver(urlResolver)
-        }
-    }
-
-    void grailsCentral() {
-        if (isResolverNotAlreadyDefined('grailsCentral')) {
-            grailsRepo("http://svn.codehaus.org/grails-plugins", "grailsCentral")
-            grailsRepo("http://svn.codehaus.org/grails/trunk/grails-plugins", "grailsCore")
-        }
-    }
-
-    void mavenCentral() {
-        if (isResolverNotAlreadyDefined('mavenCentral')) {
-            repositoryData << ['type':'mavenCentral']
-            IBiblioResolver mavenResolver = new IBiblioResolver(name:"mavenCentral")
-            mavenResolver.m2compatible = true
-            mavenResolver.settings = ivySettings
-            mavenResolver.changingPattern = ".*SNAPSHOT"
-            addToChainResolver(mavenResolver)
-        }
-    }
-
-    void mavenLocal(String repoPath) {
-        if (isResolverNotAlreadyDefined('mavenLocal')) {
-            repositoryData << ['type':'mavenLocal']
-            FileSystemResolver localMavenResolver = new FileSystemResolver(name:'localMavenResolver')
-            localMavenResolver.local = true
-            localMavenResolver.m2compatible = true
-            localMavenResolver.changingPattern = ".*SNAPSHOT"
-
-            String m2UserDir = "${System.getProperty('user.home')}/.m2"
-            String repositoryPath = repoPath
-
-            if (!repositoryPath) {
-                repositoryPath = m2UserDir + "/repository"
-
-                File mavenSettingsFile = new File("${m2UserDir}/settings.xml")
-                if (mavenSettingsFile.exists()) {
-                    def settingsXml = new XmlSlurper().parse(mavenSettingsFile)
-                    String localRepository = settingsXml.localRepository.text()
-                    
-                    if (localRepository.trim()) {
-                        repositoryPath = localRepository
-                    }
-                }
-            }
-
-            localMavenResolver.addIvyPattern(
-                "${repositoryPath}/[organisation]/[module]/[revision]/[module]-[revision](-[classifier]).pom")
-
-            localMavenResolver.addArtifactPattern(
-                "${repositoryPath}/[organisation]/[module]/[revision]/[module]-[revision](-[classifier]).[ext]")
-
-            localMavenResolver.settings = ivySettings
-            addToChainResolver(localMavenResolver)
-        }
-    }
-
-    void dependencies(Closure deps) {
-		if(pluginsOnly) return
-        deps?.delegate = this
-        deps?.call()
-    }
-
-    def invokeMethod(String name, args) {
-        if (!args || !((args[0] instanceof CharSequence)||(args[0] instanceof Map)||(args[0] instanceof Collection))) {
-            println "WARNING: Configurational method [$name] in grails-app/conf/BuildConfig.groovy doesn't exist. Ignoring.."
-        }
-        else {
-            def dependencies = args
-            def callable
-            if (dependencies && (dependencies[-1] instanceof Closure)) {
-                callable = dependencies[-1]
-                dependencies = dependencies[0..-2]
-            }
-
-            if (dependencies) {
-                parseDependenciesInternal(dependencies, name, callable)
-            }
-        }
-    }
-
-    private parseDependenciesInternal(dependencies, String scope, Closure dependencyConfigurer) {
-
-        boolean usedArgs = false
-        
-
-        
-
-        def parseDep = { dependency ->
-            if ((dependency instanceof CharSequence)) {
-                def args = [:]
-                if (dependencies[-1] instanceof Map) {
-                    args = dependencies[-1]
-                    usedArgs = true
-                }
-                def depDefinition = dependency.toString()
-
-                def m = depDefinition =~ /([a-zA-Z0-9\-\/\._+=]*?):([a-zA-Z0-9\-\/\._+=]+?):([a-zA-Z0-9\-\/\._+=]+)/
-
-                if (m.matches()) {
-
-                    String name = m[0][2]
-                    boolean isExcluded = currentPluginBeingConfigured ? isExcludedFromPlugin(currentPluginBeingConfigured, name) : isExcluded(name)
-                    if (!isExcluded) {
-                        def group = m[0][1]
-                        def version = m[0][3]
-                        if (pluginMode) {
-                            group = group ?: 'org.grails.plugins'
-                        }
-
-                        def mrid = ModuleRevisionId.newInstance(group, name, version)
-
-                        def dependencyDescriptor = new EnhancedDefaultDependencyDescriptor(mrid, false, getBooleanValue(args, 'transitive'), scope)
-
-                        if (!pluginMode) {
-                            addDependency mrid
-                        }
-                        else {
-                            def artifact = new DefaultDependencyArtifactDescriptor(dependencyDescriptor, name, "zip", "zip", null, null )
-                            dependencyDescriptor.addDependencyArtifact(scope, artifact)
-                        }
-                        dependencyDescriptor.exported = getBooleanValue(args, 'export')
-                        dependencyDescriptor.inherited = inherited || inheritsAll || currentPluginBeingConfigured
-
-                        if (currentPluginBeingConfigured) {
-                            dependencyDescriptor.plugin = currentPluginBeingConfigured
-                        }
-                        configureDependencyDescriptor(dependencyDescriptor, scope, dependencyConfigurer, pluginMode)
-                    }
-                }
-                else {
-                    println "WARNING: Specified dependency definition ${scope}(${depDefinition.inspect()}) is invalid! Skipping.."
-                }
-            }
-            else if (dependency instanceof Map) {
-                def name = dependency.name
-				def group = dependency.group
-				def version = dependency.version
-				
-                if (!group && pluginMode) group = "org.grails.plugins"
-
-                if (group && name && version) {
-                    boolean isExcluded = currentPluginBeingConfigured ? isExcludedFromPlugin(currentPluginBeingConfigured, name) : isExcluded(name)
-                    if (!isExcluded) {
-                        def attrs = [:]
-                        if(dependency.classifier) {
-                            attrs["m:classifier"] = dependency.classifier
-                        }
-
-                        def mrid
-                        if (dependency.branch) {
-                            mrid = ModuleRevisionId.newInstance(group, name, dependency.branch, version, attrs)
-                        }
-                        else {
-                            mrid = ModuleRevisionId.newInstance(group, name, version, attrs)
-                        }
-
-                        def dependencyDescriptor = new EnhancedDefaultDependencyDescriptor(mrid, false, getBooleanValue(dependency, 'transitive'), scope)
-                        if (!pluginMode) {
-                            addDependency mrid
-                        }
-                        else {
-                            def artifact
-                            if (dependency.classifier == 'plugin') {
-                                artifact = new DefaultDependencyArtifactDescriptor(dependencyDescriptor, name, "xml", "xml", null, null )
-                            }
-                            else {
-                                artifact = new DefaultDependencyArtifactDescriptor(dependencyDescriptor, name, "zip", "zip", null, null )
-                            }
-
-                            dependencyDescriptor.addDependencyArtifact(scope, artifact)
-                        }
-
-                        dependencyDescriptor.exported = getBooleanValue(dependency, 'export')
-                        dependencyDescriptor.inherited = inherited || inheritsAll
-                        if (currentPluginBeingConfigured) {
-                            dependencyDescriptor.plugin = currentPluginBeingConfigured
-                        }
-
-                        configureDependencyDescriptor(dependencyDescriptor, scope, dependencyConfigurer, pluginMode)
-                    }
-                }
-            }
-        }
-
-		
-		for(dep in dependencies ) {
-			if((dependencies[-1] == dep) && usedArgs) return 
-			parseDep(dep) 
-		}
+    RepositoryCacheManager getRepositoryCacheManager() {
+        return null;  //To change body of implemented methods use File | Settings | File Templates.
     }
 }
-

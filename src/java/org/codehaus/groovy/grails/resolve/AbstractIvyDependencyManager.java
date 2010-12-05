@@ -331,7 +331,7 @@ public abstract class AbstractIvyDependencyManager {
         }
     }
 
-    public ModuleDescriptor createModuleDescriptor() {
+    public DefaultModuleDescriptor createModuleDescriptor() {
         // This is a blatant hack: we use an organisation that is highly
         // unlikely to conflict with the project's dependencies. The
         // truth is, the dependency manager doesn't really care what the

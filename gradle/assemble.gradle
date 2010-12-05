@@ -215,11 +215,13 @@ task coreJar(type: Jar, description: 'Package up core JAR containing the central
     mavenArtifact = true
 }
 
-task osgiJar(type: Jar, dependsOn: [bootstrapJar, coreJar], description: 'Create an OSGi jar that merges the core and bootstrap JARs for OSGi comptabibility.') {
+/*
+task osgiJar(type: Jar, dependsOn: [bootstrapJar, coreJar], description: 'Create an OSGi jar that merges the core and bootstrap JARs for OSGi compatibility.') {
     appendix = "osgi"
     from bootstrapJar.archivePath, coreJar.archivePath
     osgify = true
 }
+*/
 
 task initBundlor(type: Copy) {
     dir = "$buildDir/bundlor"

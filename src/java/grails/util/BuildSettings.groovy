@@ -43,6 +43,7 @@ import java.util.concurrent.ConcurrentHashMap
  * but not others. If you set one of them explicitly, set all of them
  * to ensure consistent behaviour.</p>
  */
+@Typed(TypePolicy.MIXED)
 class BuildSettings extends AbstractBuildSettings {
     static final Pattern JAR_PATTERN = ~/^\S+\.jar$/
     /**
